@@ -51,6 +51,11 @@ struct DX11RendererTestAccess {
     {
         return renderer.m_presentCapDeadline;
     }
+    static void DisablePresentCapTimer(DX11Renderer& renderer)
+    {
+        if (renderer.m_presentCapTimer) CloseHandle(renderer.m_presentCapTimer);
+        renderer.m_presentCapTimer = nullptr;
+    }
 };
 }
 
@@ -172,6 +177,16 @@ int main()
         renderer.BeginFrame(false);
         Require(renderer.ConsumePhaseTimes().iterations == 0,
                 "source/capture pacing does not acquire a second refresh wait");
+
+        DX11RendererTestAccess::DisablePresentCapTimer(renderer);
+        DX11RendererTestAccess::PinMarker(renderer, false, 0.0);
+        renderer.SetVSync(false);
+        renderer.SetPresentCap(120.0);
+        DX11RendererTestAccess::StartInterval(renderer);
+        const auto fallbackDeadline = DX11RendererTestAccess::Deadline(renderer);
+        renderer.WaitForFrameReady();
+        Require(Clock::now() >= fallbackDeadline,
+                "an unavailable high-resolution timer still enforces the cap deadline");
         std::cout << "PASS offscreen WARP cap, Low Latency, VSync, Off and marker wait paths\n";
     } catch (const std::exception& error) {
         std::cerr << "FAIL " << error.what() << '\n';

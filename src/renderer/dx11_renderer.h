@@ -350,6 +350,7 @@ private:
     double                         m_vrrCapHz = 0.0;
     bool                           m_presentCapFromMarker = false;
     float                          m_aspectOverride = 0.0f;
+    HANDLE                         m_presentCapTimer = nullptr;
     // Next refresh-paced release, based on the preceding completed wait.
     std::chrono::steady_clock::time_point m_presentCapDeadline{};
 

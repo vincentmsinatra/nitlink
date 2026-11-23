@@ -15,6 +15,7 @@
 #include <filesystem>
 #include <fstream>
 #include <chrono>
+#include <ratio>
 #include <thread>
 #pragma comment(lib, "d3dcompiler.lib")
 #pragma comment(lib, "windowscodecs.lib")
@@ -842,7 +843,12 @@ struct TransformCB {
     float pad1;
 };
 
-DX11Renderer::DX11Renderer() = default;
+DX11Renderer::DX11Renderer()
+    : m_presentCapTimer(CreateWaitableTimerExW(nullptr, nullptr,
+          CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_MODIFY_STATE | SYNCHRONIZE))
+{
+}
+
 DX11Renderer::~DX11Renderer()
 {
     // Unbind every view and drain the context before the members release.
@@ -862,6 +868,7 @@ DX11Renderer::~DX11Renderer()
         CloseHandle(m_frameLatencyWaitable);
         m_frameLatencyWaitable = nullptr;
     }
+    if (m_presentCapTimer) CloseHandle(m_presentCapTimer);
 }
 
 bool DX11Renderer::Initialize(HWND hwnd, uint32_t width, uint32_t height)
@@ -1798,7 +1805,8 @@ DX11Renderer::PhaseTimes DX11Renderer::ConsumePhaseTimes()
 
 void DX11Renderer::WaitForFrameReady()
 {
-    const auto phaseStart = std::chrono::steady_clock::now();
+    using Clock = std::chrono::steady_clock;
+    const auto phaseStart = Clock::now();
     m_phaseWaits++;
     // The DXGI 1.3 low-latency wait, callable on its own so the Low-Latency
     // loop can wait at the TOP of the iteration, then read the freshest capture
@@ -1812,16 +1820,35 @@ void DX11Renderer::WaitForFrameReady()
         m_phaseDiagnostics.capWaits++;
         const auto interval = std::chrono::nanoseconds((long long)(1.0e9 / m_vrrCapHz));
         const auto target   = m_presentCapDeadline;
-        while (std::chrono::steady_clock::now() < target) {
-            const auto remain = target - std::chrono::steady_clock::now();
-            if (remain > std::chrono::milliseconds(2))
+        // A 1 ms sleep can take a whole Windows timer tick and overshoot the
+        // cap deadline. Wake just before the deadline, then yield
+        // through the small remainder before taking the latest capture frame.
+        using TimerTicks = std::chrono::duration<LONGLONG, std::ratio<1, 10'000'000>>;
+        constexpr auto kTimerLead = std::chrono::microseconds(500);
+        const auto delay = std::chrono::duration_cast<TimerTicks>(
+            target - Clock::now() - kTimerLead);
+        if (m_presentCapTimer && delay.count() > 0) {
+            LARGE_INTEGER dueTime{};
+            dueTime.QuadPart = -delay.count(); // Negative value is a relative delay in 100 ns ticks.
+            if (!SetWaitableTimer(m_presentCapTimer, &dueTime, 0, nullptr, nullptr, FALSE) ||
+                WaitForSingleObject(m_presentCapTimer, 1000) != WAIT_OBJECT_0) {
+                OutputDebugStringW(L"[NitLink/Renderer] Present cap timer failed; using the fallback wait\n");
+                CloseHandle(m_presentCapTimer);
+                m_presentCapTimer = nullptr;
+            }
+        }
+        // The high-resolution flag is supported starting in Windows 10 1803.
+        // Keep the previous wait on systems where the timer is unavailable.
+        for (auto remain = target - Clock::now(); remain > Clock::duration::zero();
+             remain = target - Clock::now()) {
+            if (!m_presentCapTimer && remain > std::chrono::milliseconds(2))
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
             else
                 std::this_thread::yield();
         }
         // Schedule from the completed wait so lateness cannot shorten the next
         // release interval. Render work still runs inside that interval.
-        const auto waitCompletedAt = std::chrono::steady_clock::now();
+        const auto waitCompletedAt = Clock::now();
         m_presentCapDeadline = AdvancePresentCapDeadline(target, waitCompletedAt, interval);
     } else if (m_frameLatencyWaitable) {
         m_phaseDiagnostics.waitableWaits++;
@@ -1830,7 +1857,7 @@ void DX11Renderer::WaitForFrameReady()
         else if (result == WAIT_FAILED) m_phaseDiagnostics.waitFailed++;
         else if (result == WAIT_IO_COMPLETION) m_phaseDiagnostics.waitAlerted++;
     }
-    m_phaseWaitMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - phaseStart).count();
+    m_phaseWaitMs += std::chrono::duration<double, std::milli>(Clock::now() - phaseStart).count();
 }
 
 void DX11Renderer::BeginFrame(bool doWait)
