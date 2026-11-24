@@ -919,6 +919,7 @@ bool AudioRouter::FifoReset(UINT32 bytesPerFrame, UINT32 samplesPerSec)
     ResetDrift();
     m_winStart   = std::chrono::steady_clock::now();
     m_winIn = m_winOut = m_winUnderrun = m_winOverrun = m_winSlipDrop = m_winSlipDup = 0;
+    m_winDiscontinuities = m_winTimestampErrors = 0;
     m_winFillMin = 0xFFFFFFFFu;
     m_winFillMax = 0;
     return true;
@@ -996,17 +997,21 @@ bool AudioRouter::DrainCapture()
             HandleStreamError(FAILED(release) ? release : E_INVALIDARG, L"invalid capture packet", true);
             return false;
         }
-        if ((flags & AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY) && m_fifoPrimed) {
-            m_fifoHead = m_fifoBytes = 0;
-            m_fifoPrimed = false;
-            ++m_resyncs;
-            ResetDrift();
-        }
-        if (flags & (AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR | AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY))
+        // A packet discontinuity breaks the capture clock's timeline. Keep
+        // the playable audio already queued and let the render-side underrun
+        // handler recover only if the gap actually exhausts that audio.
+        if (flags & AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY) {
+            ++m_winDiscontinuities;
             m_captureClockRate.Reset();
-        else if (frames)
+        }
+        // An uncertain timestamp alone does not invalidate the earlier fit.
+        // The estimator will expire it if reliable timestamps stop arriving.
+        if (flags & AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR) {
+            ++m_winTimestampErrors;
+        } else if (frames) {
             m_captureClockRate.Sample(devicePosition, qpcPosition, m_samplesPerSec,
                 std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count());
+        }
         FifoPush(data, frames, (flags & AUDCLNT_BUFFERFLAGS_SILENT) != 0);
         m_winIn += frames;
         hr = m_captureService->ReleaseBuffer(frames);
@@ -1272,10 +1277,13 @@ void AudioRouter::LogStatsIfDue()
        << L" ppm, estimate " << m_estimatedPpm.load() << L" ppm (valid " << m_clockEstimateValid.load()
        << L"), underrun events " << m_underrunEvents.load() << L", automatic reloads " << m_automaticReloads.load()
        << L", resync " << m_resyncs.load()
+       << L", capture discontinuities " << m_winDiscontinuities
+       << L", bad capture timestamps " << m_winTimestampErrors
        << L", slip +" << m_winSlipDrop << L"/-" << m_winSlipDup;
     AudioLog(ss.str());
     m_winStart = now;
     m_winIn = m_winOut = m_winUnderrun = m_winOverrun = m_winSlipDrop = m_winSlipDup = 0;
+    m_winDiscontinuities = m_winTimestampErrors = 0;
     m_winFillMin = 0xFFFFFFFFu;
     m_winFillMax = 0;
 }

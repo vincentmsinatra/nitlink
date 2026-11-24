@@ -6,10 +6,13 @@
 #include <cstdint>
 #include <string>
 #include <chrono>
+#include <memory>
 
 using Microsoft::WRL::ComPtr;
 
 namespace NitLink {
+
+class VulkanPresenter;
 
 class DX11Renderer {
     friend struct DX11RendererTestAccess;
@@ -17,7 +20,8 @@ public:
     DX11Renderer();
     ~DX11Renderer();
 
-    bool Initialize(HWND hwnd, uint32_t width, uint32_t height);
+    bool Initialize(HWND hwnd, uint32_t width, uint32_t height, bool preferVulkan = false);
+    bool UsesVulkanPresentation() const;
     // Returns false when the swap chain kept its previous buffers; rendering
     // continues at the previous size and the caller retries the resize.
     bool Resize(uint32_t width, uint32_t height);
@@ -176,7 +180,7 @@ public:
 
     ID3D11Device*        GetDevice()    const { return m_device.Get(); }
     ID3D11DeviceContext* GetContext()   const { return m_context.Get(); }
-    IDXGISwapChain1*     GetSwapChain() const { return m_swapChain.Get(); }
+    HRESULT GetPresentationTexture(ID3D11Texture2D** texture) const;
 
     // Returns the most recent averaged end-to-end render time in milliseconds.
     // Averaged over a sliding window inside the renderer; the value updates
@@ -311,8 +315,8 @@ private:
     bool CreatePostInputTarget(uint32_t w, uint32_t h);
     void ReleasePostInputTarget();
     bool CreateCompositeShader();
-    bool CreateCaptureResources(uint32_t width, uint32_t height, bool isNV12);
-    bool CreateCaptureResourcesP010(uint32_t width, uint32_t height);
+    bool CreateCaptureResources(uint32_t width, uint32_t height, CaptureFormatKind format,
+                                bool splitPlanes = false);
     bool CreateFullscreenQuad();
     bool CreateGpuTimingQueries();
     void UpdateAspectTransform();
@@ -331,6 +335,11 @@ private:
     ComPtr<ID3D11Device>           m_device;
     ComPtr<ID3D11DeviceContext>    m_context;
     ComPtr<IDXGISwapChain1>        m_swapChain;
+#ifdef NITLINK_ENABLE_VULKAN
+    std::unique_ptr<VulkanPresenter> m_vulkan;
+    ComPtr<ID3D11Texture2D> m_vulkanTarget;
+    bool ResizeVulkanTarget(uint32_t width, uint32_t height, DXGI_FORMAT format);
+#endif
 
     // Frame-latency waitable object (DXGI 1.3 low-latency technique).
     // Waiting on this handle at the top of every frame allows DXGI to signal
@@ -428,6 +437,7 @@ private:
     //   P010: m_captureSRV samples the Y plane as R16_UNORM (top 10 bits
     //         used); m_captureSRV_UV samples interleaved UV as R16G16_UNORM.
     ComPtr<ID3D11Texture2D>          m_captureTexture;
+    ComPtr<ID3D11Texture2D>          m_captureTextureUV; // Separate plane if a native planar texture is unavailable.
     ComPtr<ID3D11ShaderResourceView> m_captureSRV;     // Y plane or BGRA full
     ComPtr<ID3D11ShaderResourceView> m_captureSRV_UV;  // UV plane (NV12/P010)
     ComPtr<ID3D11SamplerState>       m_sampler;
@@ -435,7 +445,7 @@ private:
     uint32_t m_captureHeight = 0;
     bool     m_hasFrame      = false;
     // m_captureFormat tracks the format of the currently-ALLOCATED GPU
-    // resources. Set by CreateCaptureResources(_P010). Drives the upload
+    // resources. Set by CreateCaptureResources. Drives the upload
     // branches in UpdateCaptureTexture and the shader-binding switch in
     // DrawCaptureFrame.
     CaptureFormatKind m_captureFormat = CaptureFormatKind::BGRA;

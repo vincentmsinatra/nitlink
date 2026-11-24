@@ -10,7 +10,9 @@
 #include "app/application.h"
 #include "app/localization.h"
 #include <windows.h>
+#include <shellapi.h>
 #include <shellscalingapi.h>
+#include <cwchar>
 #pragma comment(lib, "shcore.lib")
 
 int WINAPI WinMain(
@@ -62,9 +64,17 @@ int WINAPI WinMain(
 
     int exitCode = 0;
     {
+        bool preferVulkan = false;
+        int argumentCount = 0;
+        if (auto arguments = CommandLineToArgvW(GetCommandLineW(), &argumentCount)) {
+            for (int i = 1; i < argumentCount; ++i) {
+                if (std::wcscmp(arguments[i], L"--vulkan") == 0) preferVulkan = true;
+            }
+            LocalFree(arguments);
+        }
         NitLink::Application app;
         
-        if (!app.Initialize(hInstance, nCmdShow)) {
+        if (!app.Initialize(hInstance, nCmdShow, preferVulkan)) {
             MessageBoxW(nullptr, NitLink::Localization::Instance().Get(L"error.application").c_str(),
                         L"NitLink", MB_ICONERROR);
             exitCode = 1;

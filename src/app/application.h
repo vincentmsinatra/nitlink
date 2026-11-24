@@ -35,7 +35,7 @@ public:
     Application();
     ~Application();
 
-    bool Initialize(HINSTANCE hInstance, int nCmdShow);
+    bool Initialize(HINSTANCE hInstance, int nCmdShow, bool preferVulkan);
     void Run();
     void Shutdown();
 

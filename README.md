@@ -212,6 +212,12 @@ cmake --build build --config Release
 
 Output at `out/build/x64-Release/NitLink.exe` (VS) or `build/Release/NitLink.exe` (CLI). The build copies `nitlink-menu.html`, `locales/en-US.js`, `locales/zh-TW.js`, `locales/zh-CN.js`, `locales/de-DE.js`, `locales/ko-KR.js`, `locales/tr-TR.js`, the complete `assets/menu` folder and `third_party/nis/NIS_Scaler.h` beside the `.exe`, preserving their subfolders (all are needed at runtime).
 
+### Vulkan presentation
+
+With the Vulkan SDK 1.4.328 or newer installed, configure with `-DNITLINK_ENABLE_VULKAN=ON` and launch the resulting executable with `--vulkan`. CMake can also use standalone Khronos headers through `-DNITLINK_VULKAN_INCLUDE_DIR=<path-to-include>`.
+
+Vulkan presents the composed preview using the same GPU as the Direct3D 11 video and overlay. It requires Vulkan 1.1, Win32 external memory and keyed mutex support, and a compatible swap chain. HDR output also requires Windows HDR and a Vulkan HDR10 surface format. Direct3D 11 remains the default and handles presentation when Vulkan initialization fails.
+
 ---
 
 ## Hotkeys
@@ -273,7 +279,7 @@ Settings live in `nitlink.json` in the working directory (normally next to the e
 
 ## Architecture
 
-Pure DirectX 11. Capture frames arrive via Media Foundation on a worker thread into a triple-buffered frame queue, then run through the render pipeline:
+Capture frames arrive via Media Foundation on a worker thread into a triple-buffered frame queue, then run through the Direct3D 11 render pipeline:
 
 ```
 PS5 HDMI

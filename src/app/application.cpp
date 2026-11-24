@@ -432,7 +432,7 @@ static std::wstring JsonEscapeWide(const std::wstring& s)
 Application::Application() = default;
 Application::~Application() { Shutdown(); }
 
-bool Application::Initialize(HINSTANCE hInstance, int nCmdShow)
+bool Application::Initialize(HINSTANCE hInstance, int nCmdShow, bool preferVulkan)
 {
     AppLog(L"Initialize: begin");
 
@@ -486,7 +486,7 @@ bool Application::Initialize(HINSTANCE hInstance, int nCmdShow)
     }
 
     m_renderer = std::make_unique<DX11Renderer>();
-    if (!m_renderer->Initialize(m_window->GetHWND(), actualW, actualH)) {
+    if (!m_renderer->Initialize(m_window->GetHWND(), actualW, actualH, preferVulkan)) {
         AppLog(L"Initialize: Renderer::Initialize FAILED");
         return false;
     }
@@ -498,9 +498,7 @@ bool Application::Initialize(HINSTANCE hInstance, int nCmdShow)
     // flashing white during potentially slow capture-device bring-up.
     // Present an explicit startup state before making the window visible.
     m_overlay = std::make_unique<Overlay>();
-    const bool startupOverlayOk = m_overlay->Initialize(
-        m_renderer->GetDevice(), m_renderer->GetContext(),
-        m_renderer->GetSwapChain(), m_window->GetHWND());
+    const bool startupOverlayOk = m_overlay->Initialize(*m_renderer);
     if (!startupOverlayOk) {
         AppLog(L"Initialize: startup Overlay::Initialize FAILED (showing dark renderer clear)");
     } else {
@@ -4694,8 +4692,7 @@ bool Application::RecoverFromDeviceLost()
     // running. (Kept in lock-step with the Initialize bring-up at the overlay/
     // NIS/frame-differ block.)
     if (!m_overlay) m_overlay = std::make_unique<Overlay>();
-    if (m_overlay->Initialize(m_renderer->GetDevice(), m_renderer->GetContext(),
-                              m_renderer->GetSwapChain(), m_window->GetHWND())) {
+    if (m_overlay->Initialize(*m_renderer)) {
         ApplyNoSignalSettings();
         m_showOverlay = m_config->showOverlay;
     } else {
@@ -4763,6 +4760,8 @@ bool Application::RecoverFromDeviceLost()
     }
 
     AppLog(L"Device lost: rebuild complete");
+    UpdateWindowTitle();
+    if (m_settingsVisible) PushSettingsState();
     return true;
 }
 
@@ -5027,6 +5026,8 @@ void Application::PushSettingsState(bool refreshCaptureDevices)
     js << L"\"colorExpansionAvailable\":"
        << (m_renderer && m_renderer->IsColorExpansionAvailable() ? L"true" : L"false") << L",";
     js << L"\"nisEnabled\":"        << (m_config->nisEnabled        ? L"true" : L"false") << L",";
+    js << L"\"vulkanPresentation\":"
+       << (m_renderer && m_renderer->UsesVulkanPresentation() ? L"true" : L"false") << L",";
     js << L"\"presentPacing\":\""
        << (m_config->presentPacing == kPacingUnique   ? L"unique"
          : m_config->presentPacing == kPacingCaptured ? L"captured"
@@ -5492,6 +5493,7 @@ void Application::UpdateWindowTitle()
         title += L"]";
     }
 
+    if (m_renderer && m_renderer->UsesVulkanPresentation()) title += L" [Vulkan]";
     m_window->SetTitle(title);
     UpdateDiscordForCurrentGame(/*preserveStartTime=*/ true);
 }

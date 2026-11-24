@@ -4,6 +4,7 @@
 
 #include <d3dcompiler.h>
 #include <debugapi.h>
+#include <dxgi.h>
 #include <sstream>
 #include <string>
 #include <fstream>
@@ -144,11 +145,18 @@ public:
 
 bool NisUpscaler::CompileShader(ID3D11Device* device)
 {
-    // Optimal dispatch sizes for typical NVIDIA hardware via NIS_Config.h's
-    // NISOptimizer with NVIDIA_Generic. The same values get baked into the
-    // shader as macros below AND used at Dispatch() time, so the shader's
-    // [numthreads(...)] and the groupsX/Y math stay in sync by construction.
-    NISOptimizer opt(true, NISGPUArchitecture::NVIDIA_Generic_fp16);
+    ComPtr<IDXGIDevice> dxgiDevice;
+    ComPtr<IDXGIAdapter> adapter;
+    DXGI_ADAPTER_DESC desc{};
+    constexpr UINT kAmdVendorId = 0x1002;
+    const bool isAmd = SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&dxgiDevice))) &&
+        SUCCEEDED(dxgiDevice->GetAdapter(&adapter)) && SUCCEEDED(adapter->GetDesc(&desc)) &&
+        desc.VendorId == kAmdVendorId;
+
+    // The AMD SDK profile uses full precision and a different thread group.
+    // Use the same block dimensions for shader compilation and dispatch.
+    NISOptimizer opt(true, isAmd ? NISGPUArchitecture::AMD_Generic
+                                : NISGPUArchitecture::NVIDIA_Generic_fp16);
     m_blockWidth      = opt.GetOptimalBlockWidth();
     m_blockHeight     = opt.GetOptimalBlockHeight();
     m_threadGroupSize = opt.GetOptimalThreadGroupSize();
@@ -162,7 +170,7 @@ bool NisUpscaler::CompileShader(ID3D11Device* device)
         { "NIS_HLSL",               "1" },
         { "NIS_SCALER",             "1" },
         { "NIS_HDR_MODE",           "0" },
-        { "NIS_USE_HALF_PRECISION", "1" },
+        { "NIS_USE_HALF_PRECISION", isAmd ? "0" : "1" },
         { "NIS_BLOCK_WIDTH",      bw.c_str() },
         { "NIS_BLOCK_HEIGHT",     bh.c_str() },
         { "NIS_THREAD_GROUP_SIZE", tg.c_str() },

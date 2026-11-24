@@ -18,6 +18,8 @@ using Microsoft::WRL::ComPtr;
 
 namespace NitLink {
 
+class DX11Renderer;
+
 class Overlay {
 public:
     struct Stats {
@@ -48,8 +50,7 @@ public:
         bool         colorExpansion   = false;
     };
 
-    bool Initialize(ID3D11Device* device, ID3D11DeviceContext* context,
-                    IDXGISwapChain1* swapChain, HWND hwnd);
+    bool Initialize(DX11Renderer& renderer);
     bool RefreshTextFormats();
     // Updates only the custom No Signal presentation. The application converts
     // its UTF-8 config path to UTF-16 before crossing this boundary. Decoding
@@ -135,8 +136,7 @@ private:
 
     ID3D11Device*        m_device    = nullptr;
     ID3D11DeviceContext* m_context   = nullptr;
-    IDXGISwapChain1*     m_swapChain = nullptr;
-    HWND                 m_hwnd      = nullptr;
+    DX11Renderer*        m_renderer  = nullptr;
 
     // D2D / DirectWrite for text rendering directly onto the swap chain
     ComPtr<ID2D1Factory1>    m_d2dFactory;

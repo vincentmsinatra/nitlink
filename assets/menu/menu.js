@@ -893,6 +893,9 @@
       const setToggle = (id, on) => { const el = document.getElementById(id); if (el) el.classList.toggle('on', !!on); };
       const setText = (id, txt) => { const el = document.getElementById(id); if (el) el.textContent = txt; };
       const setHidden = (id, hidden) => { const el = document.getElementById(id); if (el) el.hidden = hidden; };
+      setText('about-renderer', s.vulkanPresentation
+        ? 'D3D11 + Vulkan · P010 / NV12 / BGRA'
+        : 'D3D11 · P010 / NV12 / BGRA');
       setToggle('toggle-hdr', s.hdrEnabled);
       setToggle('toggle-color', s.colorExpansion);
       setHidden('color-expansion-advanced', s.colorExpansionAvailable !== true);

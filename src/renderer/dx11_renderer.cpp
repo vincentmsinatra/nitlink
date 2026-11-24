@@ -3,6 +3,9 @@
 #include "renderer/hdr_tone_map.h"
 #include "renderer/hdr_tone_map_hlsl.h"
 #include "renderer/present_cap_clock.h"
+#ifdef NITLINK_ENABLE_VULKAN
+#include "renderer/vulkan_presenter.h"
+#endif
 #include <d3dcompiler.h>
 #include <array>
 #include <sstream>
@@ -17,6 +20,7 @@
 #include <chrono>
 #include <ratio>
 #include <thread>
+#include <utility>
 #pragma comment(lib, "d3dcompiler.lib")
 #pragma comment(lib, "windowscodecs.lib")
 
@@ -871,7 +875,7 @@ DX11Renderer::~DX11Renderer()
     if (m_presentCapTimer) CloseHandle(m_presentCapTimer);
 }
 
-bool DX11Renderer::Initialize(HWND hwnd, uint32_t width, uint32_t height)
+bool DX11Renderer::Initialize(HWND hwnd, uint32_t width, uint32_t height, bool preferVulkan)
 {
     m_hwnd = hwnd;
     m_windowWidth = width;
@@ -945,43 +949,58 @@ bool DX11Renderer::Initialize(HWND hwnd, uint32_t width, uint32_t height)
         return false;
     }
 
-    hr = factory->CreateSwapChainForHwnd(
-        m_device.Get(), hwnd, &scd, nullptr, nullptr, &m_swapChain);
-    if (FAILED(hr)) {
-        // DXGI_ERROR_INVALID_CALL here means the window still carries a swap
-        // chain, normally one left alive by an object that survived a lost
-        // device.
-        OutputDebugStringW((L"[NitLink/Renderer] CreateSwapChainForHwnd failed " + HrToHex(hr) + L"\n").c_str());
-        return false;
-    }
-
-    factory->MakeWindowAssociation(hwnd, DXGI_MWA_NO_ALT_ENTER);
-
-    // DXGI 1.3 low-latency setup. The waitable-object flag was requested at
-    // creation time; now retrieve the handle and clamp the maximum frame
-    // queue depth to 1. This is the canonical Microsoft-recommended pattern
-    // for low-input-latency apps.
-    //
-    // SetMaximumFrameLatency(1):
-    //   Default for waitable swap chains is also 1, but set explicitly here
-    //   in case a future Windows release changes the default. Increasing
-    //   beyond 1 would trade latency for CPU-GPU parallelism: latency wins
-    //   here over parallelism, since rendering a fullscreen quad is cheap.
-    //
-    // GetFrameLatencyWaitableObject:
-    //   Returns a handle that DXGI signals when it's ready to accept another
-    //   frame. The handle is closed in the destructor.
-    ComPtr<IDXGISwapChain2> sc2;
-    if (SUCCEEDED(m_swapChain.As(&sc2))) {
-        sc2->SetMaximumFrameLatency(1);
-        m_frameLatencyWaitable = sc2->GetFrameLatencyWaitableObject();
-        if (m_frameLatencyWaitable) {
-            OutputDebugStringW(L"[NitLink/Renderer] Low-latency mode: waitable swap chain enabled (max frame latency = 1)\n");
-        } else {
-            OutputDebugStringW(L"[NitLink/Renderer] WARN: GetFrameLatencyWaitableObject returned null; running without latency wait\n");
+#ifdef NITLINK_ENABLE_VULKAN
+    if (preferVulkan) {
+        DXGI_ADAPTER_DESC desc{};
+        m_vulkan = std::make_unique<VulkanPresenter>();
+        if (FAILED(adapter->GetDesc(&desc)) || !m_vulkan->Initialize(hwnd, desc.AdapterLuid) ||
+            !ResizeVulkanTarget(width, height, scd.Format)) {
+            m_vulkan.reset();
         }
-    } else {
-        OutputDebugStringW(L"[NitLink/Renderer] WARN: IDXGISwapChain2 unavailable; running without latency wait\n");
+    }
+#endif
+    if (preferVulkan && !UsesVulkanPresentation()) {
+        OutputDebugStringW(L"[NitLink/Renderer] Vulkan presentation unavailable; using Direct3D 11\n");
+    }
+    if (!UsesVulkanPresentation()) {
+        hr = factory->CreateSwapChainForHwnd(
+            m_device.Get(), hwnd, &scd, nullptr, nullptr, &m_swapChain);
+        if (FAILED(hr)) {
+            // DXGI_ERROR_INVALID_CALL here means the window still carries a swap
+            // chain, normally one left alive by an object that survived a lost
+            // device.
+            OutputDebugStringW((L"[NitLink/Renderer] CreateSwapChainForHwnd failed " + HrToHex(hr) + L"\n").c_str());
+            return false;
+        }
+
+        factory->MakeWindowAssociation(hwnd, DXGI_MWA_NO_ALT_ENTER);
+
+        // DXGI 1.3 low-latency setup. The waitable-object flag was requested at
+        // creation time; now retrieve the handle and clamp the maximum frame
+        // queue depth to 1. This is the canonical Microsoft-recommended pattern
+        // for low-input-latency apps.
+        //
+        // SetMaximumFrameLatency(1):
+        //   Default for waitable swap chains is also 1, but set explicitly here
+        //   in case a future Windows release changes the default. Increasing
+        //   beyond 1 would trade latency for CPU-GPU parallelism: latency wins
+        //   here over parallelism, since rendering a fullscreen quad is cheap.
+        //
+        // GetFrameLatencyWaitableObject:
+        //   Returns a handle that DXGI signals when it's ready to accept another
+        //   frame. The handle is closed in the destructor.
+        ComPtr<IDXGISwapChain2> sc2;
+        if (SUCCEEDED(m_swapChain.As(&sc2))) {
+            sc2->SetMaximumFrameLatency(1);
+            m_frameLatencyWaitable = sc2->GetFrameLatencyWaitableObject();
+            if (m_frameLatencyWaitable) {
+                OutputDebugStringW(L"[NitLink/Renderer] Low-latency mode: waitable swap chain enabled (max frame latency = 1)\n");
+            } else {
+                OutputDebugStringW(L"[NitLink/Renderer] WARN: GetFrameLatencyWaitableObject returned null; running without latency wait\n");
+            }
+        } else {
+            OutputDebugStringW(L"[NitLink/Renderer] WARN: IDXGISwapChain2 unavailable; running without latency wait\n");
+        }
     }
 
     // VRR present-rate cap (VRR_CAP.txt next to the exe): rate-cap the ALLOW_TEARING
@@ -1068,12 +1087,56 @@ bool DX11Renderer::Initialize(HWND hwnd, uint32_t width, uint32_t height)
 bool DX11Renderer::CreateRenderTarget()
 {
     ComPtr<ID3D11Texture2D> backBuffer;
-    HRESULT hr = m_swapChain->GetBuffer(0, IID_PPV_ARGS(&backBuffer));
+    HRESULT hr = GetPresentationTexture(&backBuffer);
     if (FAILED(hr)) return false;
 
     hr = m_device->CreateRenderTargetView(backBuffer.Get(), nullptr, &m_rtv);
     return SUCCEEDED(hr);
 }
+
+bool DX11Renderer::UsesVulkanPresentation() const
+{
+#ifdef NITLINK_ENABLE_VULKAN
+    return m_vulkan != nullptr;
+#else
+    return false;
+#endif
+}
+
+HRESULT DX11Renderer::GetPresentationTexture(ID3D11Texture2D** texture) const
+{
+#ifdef NITLINK_ENABLE_VULKAN
+    if (m_vulkan) return m_vulkanTarget.CopyTo(texture);
+#endif
+    return m_swapChain ? m_swapChain->GetBuffer(0, IID_PPV_ARGS(texture)) : E_FAIL;
+}
+
+#ifdef NITLINK_ENABLE_VULKAN
+bool DX11Renderer::ResizeVulkanTarget(uint32_t width, uint32_t height, DXGI_FORMAT format)
+{
+    D3D11_TEXTURE2D_DESC desc{};
+    desc.Width = width;
+    desc.Height = height;
+    desc.MipLevels = 1;
+    desc.ArraySize = 1;
+    desc.Format = format;
+    desc.SampleDesc.Count = 1;
+    desc.Usage = D3D11_USAGE_DEFAULT;
+    desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+    ComPtr<ID3D11Texture2D> target;
+    ComPtr<ID3D11RenderTargetView> view;
+    if (FAILED(m_device->CreateTexture2D(&desc, nullptr, &target)) ||
+        FAILED(m_device->CreateRenderTargetView(target.Get(), nullptr, &view)) ||
+        !m_vulkan->Resize(m_device.Get(), width, height, format, m_vsync)) return false;
+    m_context->OMSetRenderTargets(0, nullptr, nullptr);
+    m_vulkanTarget = std::move(target);
+    m_rtv = std::move(view);
+    m_windowWidth = width;
+    m_windowHeight = height;
+    m_currentSwapFormat = format;
+    return true;
+}
+#endif
 
 void DX11Renderer::ReleaseRenderTarget()
 {
@@ -1316,177 +1379,75 @@ bool DX11Renderer::CreateFullscreenQuad()
     return SUCCEEDED(hr);
 }
 
-bool DX11Renderer::CreateCaptureResources(uint32_t width, uint32_t height, bool isNV12)
+bool DX11Renderer::CreateCaptureResources(uint32_t width, uint32_t height,
+                                           CaptureFormatKind format, bool splitPlanes)
 {
-    m_captureTexture.Reset();
-    m_captureSRV.Reset();
-    m_captureSRV_UV.Reset();
+    const bool planar = format != CaptureFormatKind::BGRA;
+    const bool tenBit = format == CaptureFormatKind::P010;
+    const DXGI_FORMAT lumaFormat = tenBit ? DXGI_FORMAT_R16_UNORM : DXGI_FORMAT_R8_UNORM;
+    const DXGI_FORMAT chromaFormat = tenBit ? DXGI_FORMAT_R16G16_UNORM : DXGI_FORMAT_R8G8_UNORM;
+    const DXGI_FORMAT nativeFormat = planar
+        ? (tenBit ? DXGI_FORMAT_P010 : DXGI_FORMAT_NV12) : DXGI_FORMAT_B8G8R8A8_UNORM;
 
-    if (isNV12) {
-        // Single NV12 texture, two SRVs (Y plane as R8, UV plane as R8G8)
-        D3D11_TEXTURE2D_DESC texDesc{};
-        texDesc.Width     = width;
-        texDesc.Height    = height;
-        texDesc.MipLevels = 1;
-        texDesc.ArraySize = 1;
-        texDesc.Format    = DXGI_FORMAT_NV12;
-        texDesc.SampleDesc = {1, 0};
-        texDesc.Usage     = D3D11_USAGE_DYNAMIC;
-        texDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-        texDesc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    auto createTexture = [&](DXGI_FORMAT textureFormat, uint32_t w, uint32_t h,
+                             ID3D11Texture2D** texture) {
+        D3D11_TEXTURE2D_DESC desc{};
+        desc.Width = w;
+        desc.Height = h;
+        desc.MipLevels = 1;
+        desc.ArraySize = 1;
+        desc.Format = textureFormat;
+        desc.SampleDesc = {1, 0};
+        desc.Usage = D3D11_USAGE_DYNAMIC;
+        desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+        return m_device->CreateTexture2D(&desc, nullptr, texture);
+    };
+    auto createView = [&](ID3D11Texture2D* texture, DXGI_FORMAT viewFormat,
+                          ID3D11ShaderResourceView** view) {
+        D3D11_SHADER_RESOURCE_VIEW_DESC desc{};
+        desc.Format = viewFormat;
+        desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+        desc.Texture2D.MipLevels = 1;
+        return m_device->CreateShaderResourceView(texture, &desc, view);
+    };
 
-        HRESULT hr = m_device->CreateTexture2D(&texDesc, nullptr, &m_captureTexture);
-        if (FAILED(hr)) return false;
-
-        D3D11_SHADER_RESOURCE_VIEW_DESC ySrv{};
-        ySrv.Format = DXGI_FORMAT_R8_UNORM;
-        ySrv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
-        ySrv.Texture2D.MipLevels = 1;
-        hr = m_device->CreateShaderResourceView(m_captureTexture.Get(), &ySrv, &m_captureSRV);
-        if (FAILED(hr)) return false;
-
-        D3D11_SHADER_RESOURCE_VIEW_DESC uvSrv{};
-        uvSrv.Format = DXGI_FORMAT_R8G8_UNORM;
-        uvSrv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
-        uvSrv.Texture2D.MipLevels = 1;
-        hr = m_device->CreateShaderResourceView(m_captureTexture.Get(), &uvSrv, &m_captureSRV_UV);
-        if (FAILED(hr)) return false;
-
-        m_captureFormat = CaptureFormatKind::NV12;
-    } else {
-        D3D11_TEXTURE2D_DESC texDesc{};
-        texDesc.Width     = width;
-        texDesc.Height    = height;
-        texDesc.MipLevels = 1;
-        texDesc.ArraySize = 1;
-        texDesc.Format    = DXGI_FORMAT_B8G8R8A8_UNORM;
-        texDesc.SampleDesc = {1, 0};
-        texDesc.Usage     = D3D11_USAGE_DYNAMIC;
-        texDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-        texDesc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
-
-        HRESULT hr = m_device->CreateTexture2D(&texDesc, nullptr, &m_captureTexture);
-        if (FAILED(hr)) return false;
-
-        D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc{};
-        srvDesc.Format = texDesc.Format;
-        srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
-        srvDesc.Texture2D.MipLevels = 1;
-
-        hr = m_device->CreateShaderResourceView(m_captureTexture.Get(), &srvDesc, &m_captureSRV);
-        if (FAILED(hr)) return false;
-
-        m_captureFormat = CaptureFormatKind::BGRA;
+    ComPtr<ID3D11Texture2D> texture, chromaTexture;
+    ComPtr<ID3D11ShaderResourceView> view, chromaView;
+    if (!splitPlanes) {
+        HRESULT hr = createTexture(nativeFormat, width, height, &texture);
+        if (SUCCEEDED(hr)) hr = createView(texture.Get(), planar ? lumaFormat : nativeFormat, &view);
+        if (SUCCEEDED(hr) && planar) hr = createView(texture.Get(), chromaFormat, &chromaView);
+        if (FAILED(hr)) {
+            FlagIfDeviceLost(hr, L"CreateCaptureResources");
+            if (!planar || m_deviceLost) return false;
+            splitPlanes = true;
+        }
+    }
+    if (splitPlanes) {
+        // Some drivers cannot map or sample a dynamic NV12/P010 texture.
+        // The shader still receives the same normalized Y and UV samples.
+        HRESULT hr = createTexture(lumaFormat, width, height, texture.ReleaseAndGetAddressOf());
+        if (SUCCEEDED(hr)) hr = createTexture(chromaFormat, width / 2, height / 2, &chromaTexture);
+        if (SUCCEEDED(hr)) hr = createView(texture.Get(), lumaFormat, view.ReleaseAndGetAddressOf());
+        if (SUCCEEDED(hr)) {
+            hr = createView(chromaTexture.Get(), chromaFormat, chromaView.ReleaseAndGetAddressOf());
+        }
+        if (FAILED(hr)) {
+            FlagIfDeviceLost(hr, L"CreateCaptureResources split planes");
+            return false;
+        }
+        OutputDebugStringW(L"[NitLink/Renderer] Using separate capture luma and chroma textures\n");
     }
 
-    m_captureWidth  = width;
+    m_captureTexture = std::move(texture);
+    m_captureTextureUV = std::move(chromaTexture);
+    m_captureSRV = std::move(view);
+    m_captureSRV_UV = std::move(chromaView);
+    m_captureWidth = width;
     m_captureHeight = height;
-    return true;
-}
-
-bool DX11Renderer::CreateCaptureResourcesP010(uint32_t width, uint32_t height)
-{
-    // P010 capture texture. The DXGI format is planar 16-bit-per-channel,
-    // with the top 10 bits of each 16-bit value carrying the data and the
-    // bottom 6 bits zero. Two SRVs are bound into the same underlying texture:
-    //   - Y plane viewed as R16_UNORM (luma)
-    //   - UV plane viewed as R16G16_UNORM (chroma, half resolution)
-    // The shader uses bilinear sampling on both; YUV to RGB conversion plus
-    // BT.2020 PQ inverse EOTF happen per-pixel in g_pixelShaderP010.
-    //
-    // P010 has stricter constraints than NV12:
-    //   - width must be even (chroma is half-res)
-    //   - height must be even (same reason)
-    //   - some drivers/feature levels don't accept D3D11_USAGE_DYNAMIC for
-    //     P010: if that happens, the failure is logged below and a
-    //     STAGING+CopyResource pattern would be the next fix.
-    m_captureTexture.Reset();
-    m_captureSRV.Reset();
-    m_captureSRV_UV.Reset();
-
-    // P010 requires even dimensions for the 4:2:0 chroma plane.
-    if ((width & 1) || (height & 1)) {
-        OutputDebugStringW(L"[NitLink/Renderer] P010 requires even dimensions; declining\n");
-        return false;
-    }
-
-    D3D11_TEXTURE2D_DESC texDesc{};
-    texDesc.Width     = width;
-    texDesc.Height    = height;
-    texDesc.MipLevels = 1;
-    texDesc.ArraySize = 1;
-    texDesc.Format    = DXGI_FORMAT_P010;
-    texDesc.SampleDesc = {1, 0};
-    texDesc.Usage     = D3D11_USAGE_DYNAMIC;
-    texDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-    texDesc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
-
-    HRESULT hr = m_device->CreateTexture2D(&texDesc, nullptr, &m_captureTexture);
-    if (FAILED(hr)) {
-        std::wstringstream ss;
-        ss << L"[NitLink/Renderer] CreateTexture2D(P010, DYNAMIC) failed hr=0x"
-           << std::hex << hr << L"\n";
-        OutputDebugStringW(ss.str().c_str());
-
-        // Retry with USAGE_DEFAULT + UpdateSubresource model? Some Windows
-        // builds reject DYNAMIC on planar 10-bit formats. That path isn't
-        // wired yet: log and return false; UpdateCaptureTexture will see
-        // null texture and skip the frame.
-        m_captureTexture.Reset();
-        return false;
-    }
-
-    OutputDebugStringW(L"[NitLink/Renderer] P010 texture created OK\n");
-
-    // Y plane SRV
-    D3D11_SHADER_RESOURCE_VIEW_DESC ySrv{};
-    ySrv.Format = DXGI_FORMAT_R16_UNORM;
-    ySrv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
-    ySrv.Texture2D.MipLevels = 1;
-    hr = m_device->CreateShaderResourceView(m_captureTexture.Get(), &ySrv, &m_captureSRV);
-    if (FAILED(hr)) {
-        std::wstringstream ss;
-        ss << L"[NitLink/Renderer] CreateSRV(P010 Y as R16_UNORM) failed hr=0x"
-           << std::hex << hr << L"\n";
-        OutputDebugStringW(ss.str().c_str());
-        // Clean up so the caller's early-return check catches this. Without
-        // it, the texture lingers while m_captureFormat stays BGRA, and
-        // the next memcpy interprets P010 bytes as BGRA: boom.
-        m_captureTexture.Reset();
-        m_captureSRV.Reset();
-        m_captureSRV_UV.Reset();
-        return false;
-    }
-
-    OutputDebugStringW(L"[NitLink/Renderer] P010 Y-plane SRV created OK\n");
-
-    // UV plane SRV
-    D3D11_SHADER_RESOURCE_VIEW_DESC uvSrv{};
-    uvSrv.Format = DXGI_FORMAT_R16G16_UNORM;
-    uvSrv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
-    uvSrv.Texture2D.MipLevels = 1;
-    hr = m_device->CreateShaderResourceView(m_captureTexture.Get(), &uvSrv, &m_captureSRV_UV);
-    if (FAILED(hr)) {
-        std::wstringstream ss;
-        ss << L"[NitLink/Renderer] CreateSRV(P010 UV as R16G16_UNORM) failed hr=0x"
-           << std::hex << hr << L"\n";
-        OutputDebugStringW(ss.str().c_str());
-        // Same cleanup as Y SRV path.
-        m_captureTexture.Reset();
-        m_captureSRV.Reset();
-        m_captureSRV_UV.Reset();
-        return false;
-    }
-
-    OutputDebugStringW(L"[NitLink/Renderer] P010 UV-plane SRV created OK\n");
-
-    m_captureWidth  = width;
-    m_captureHeight = height;
-    m_captureFormat = CaptureFormatKind::P010;
-
-    std::wstringstream ss;
-    ss << L"[NitLink/Renderer] P010 capture texture ready: " << width << L"x" << height << L"\n";
-    OutputDebugStringW(ss.str().c_str());
+    m_captureFormat = format;
+    m_hasFrame = false;
     return true;
 }
 
@@ -1555,107 +1516,60 @@ void DX11Renderer::UpdateCaptureTexture(const uint8_t* data, uint32_t size, uint
         return;
     }
 
-    // Allocate / reallocate GPU resources to match the declared format and
-    // current dimensions. m_captureFormat tracks what's currently allocated;
-    // when it diverges from m_sourceFormat (declared), tear down and rebuild.
-    // CreateCaptureResources(_P010) updates m_captureFormat at the end so
-    // subsequent calls hit the no-op path.
-    if (width != m_captureWidth ||
-        height != m_captureHeight ||
+    if (!m_captureTexture || width != m_captureWidth || height != m_captureHeight ||
         m_sourceFormat != m_captureFormat) {
-        if (m_sourceFormat == CaptureFormatKind::P010) {
-            CreateCaptureResourcesP010(width, height);
-        } else {
-            CreateCaptureResources(width, height,
-                                    m_sourceFormat == CaptureFormatKind::NV12);
-        }
+        if (!CreateCaptureResources(width, height, m_sourceFormat)) return;
     }
 
-    if (!m_captureTexture) return;
-
-    // Defensive: CreateCaptureResources* may have failed silently and left
-    // m_captureFormat still mismatched against m_sourceFormat. Uploading
-    // bytes through the wrong format's branch would memcpy past the source
-    // buffer (e.g. BGRA's 4x stride against a 1.5x NV12 buffer). Drop the
-    // frame in that case rather than risk a heap stomp.
-    if (m_sourceFormat != m_captureFormat || width != m_captureWidth || height != m_captureHeight) {
-        OutputDebugStringW(L"[NitLink/Renderer] UpdateCaptureTexture: resource allocation lagging declared format, dropping frame\n");
-        return;
-    }
-
-    D3D11_MAPPED_SUBRESOURCE mapped;
+    const bool planar = m_captureFormat != CaptureFormatKind::BGRA;
+    D3D11_MAPPED_SUBRESOURCE mapped{};
     HRESULT hr = m_context->Map(m_captureTexture.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+    if (planar && !m_captureTextureUV &&
+        (hr == E_INVALIDARG || hr == E_NOTIMPL || hr == DXGI_ERROR_UNSUPPORTED) &&
+        CreateCaptureResources(width, height, m_captureFormat, true)) {
+        hr = m_context->Map(m_captureTexture.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+    }
     if (FAILED(hr)) {
-        // The capture upload Map is the other per-frame device call besides
-        // Present, so device loss can surface here first. Latch it for the run
-        // loop rather than silently dropping every frame from now on.
         FlagIfDeviceLost(hr, L"UpdateCaptureTexture Map");
         return;
     }
 
-    if (!mapped.pData || mapped.RowPitch < rowBytes) {
-        m_context->Unmap(m_captureTexture.Get(), 0);
+    D3D11_MAPPED_SUBRESOURCE mappedChroma{};
+    if (m_captureTextureUV) {
+        hr = m_context->Map(m_captureTextureUV.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mappedChroma);
+        if (FAILED(hr)) {
+            m_context->Unmap(m_captureTexture.Get(), 0);
+            m_hasFrame = false;
+            FlagIfDeviceLost(hr, L"UpdateCaptureTexture Map chroma");
+            return;
+        }
+    }
+
+    const bool validMapping = mapped.pData && mapped.RowPitch >= rowBytes &&
+        (!m_captureTextureUV || (mappedChroma.pData && mappedChroma.RowPitch >= rowBytes));
+    if (validMapping) {
+        auto copyRows = [&](uint8_t* dst, uint32_t dstPitch, const uint8_t* src, uint32_t rows) {
+            for (uint32_t y = 0; y < rows; ++y) {
+                memcpy(dst + size_t(y) * dstPitch, src + size_t(y) * rowBytes, rowBytes);
+            }
+        };
+        auto* dst = static_cast<uint8_t*>(mapped.pData);
+        copyRows(dst, mapped.RowPitch, data, height);
+        if (planar) {
+            const auto* srcChroma = data + size_t(rowBytes) * height;
+            auto* dstChroma = m_captureTextureUV ? static_cast<uint8_t*>(mappedChroma.pData)
+                                               : dst + size_t(mapped.RowPitch) * height;
+            const auto chromaPitch = m_captureTextureUV ? mappedChroma.RowPitch : mapped.RowPitch;
+            copyRows(dstChroma, chromaPitch, srcChroma, height / 2);
+        }
+    }
+
+    if (m_captureTextureUV) m_context->Unmap(m_captureTextureUV.Get(), 0);
+    m_context->Unmap(m_captureTexture.Get(), 0);
+    if (!validMapping) {
+        m_hasFrame = false;
         return;
     }
-
-    if (m_captureFormat == CaptureFormatKind::NV12) {
-        // NV12 source layout: Y plane (width * height bytes), then UV (width * height/2 bytes interleaved)
-        // GPU texture layout: same, but with RowPitch stride
-        uint8_t*       dst   = static_cast<uint8_t*>(mapped.pData);
-        const uint8_t* srcY  = data;
-        const uint8_t* srcUV = data + (width * height);
-
-        for (uint32_t y = 0; y < height; y++) {
-            memcpy(dst + size_t(y) * mapped.RowPitch, srcY + y * width, width);
-        }
-
-        uint8_t* dstUV = dst + (size_t(mapped.RowPitch) * height);
-        for (uint32_t y = 0; y < height / 2; y++) {
-            memcpy(dstUV + size_t(y) * mapped.RowPitch, srcUV + y * width, width);
-        }
-    } else if (m_captureFormat == CaptureFormatKind::P010) {
-        // P010 source layout: Y plane is width*height 16-bit values (so
-        // width*height*2 bytes; data carried in top 10 bits, bottom 6
-        // zero), then UV plane is half-res interleaved 16-bit pairs
-        // (width*height/2 pairs = width*height*2 bytes UV total: same
-        // size as Y plane).
-        //
-        // GPU texture (DXGI_FORMAT_P010) expects the same layout but with
-        // mapped.RowPitch stride between Y plane rows. UV plane starts at
-        // dst + RowPitch * height (matching D3D11 P010 spec).
-        const uint32_t yRowBytes  = width * 2;            // 16-bit per pixel
-        const uint32_t uvRowBytes = width * 2;            // half-width pairs, each pair 4 bytes? No: see below.
-        // Actually for interleaved UV at 4:2:0:
-        //   - one chroma sample per 2x2 luma block
-        //   - U and V interleaved -> 2 chroma bytes per 2 luma samples horizontally
-        //   - At 16 bpc that's 4 bytes per 2 luma samples = 2 bytes per luma sample
-        // -> uvRowBytes == yRowBytes, but only height/2 rows total.
-
-        uint8_t*       dst   = static_cast<uint8_t*>(mapped.pData);
-        const uint8_t* srcY  = data;
-        const uint8_t* srcUV = data + (yRowBytes * height);
-
-        for (uint32_t y = 0; y < height; y++) {
-            memcpy(dst + size_t(y) * mapped.RowPitch, srcY + y * yRowBytes, yRowBytes);
-        }
-
-        uint8_t* dstUV = dst + (size_t(mapped.RowPitch) * height);
-        for (uint32_t y = 0; y < height / 2; y++) {
-            memcpy(dstUV + size_t(y) * mapped.RowPitch, srcUV + y * uvRowBytes, uvRowBytes);
-        }
-    } else {
-        // BGRA
-        uint32_t srcPitch = width * 4;
-        const uint8_t* src = data;
-        uint8_t* dst = static_cast<uint8_t*>(mapped.pData);
-        for (uint32_t y = 0; y < height; y++) {
-            memcpy(dst, src, srcPitch);
-            src += srcPitch;
-            dst += mapped.RowPitch;
-        }
-    }
-
-    m_context->Unmap(m_captureTexture.Get(), 0);
     m_phaseUploadMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - phaseStart).count();
     m_hasFrame = true;
 }
@@ -1664,6 +1578,9 @@ bool DX11Renderer::Resize(uint32_t width, uint32_t height)
 {
     if (width < 8 || height < 8) return true;
     if (width == m_windowWidth && height == m_windowHeight) return true;
+#ifdef NITLINK_ENABLE_VULKAN
+    if (m_vulkan) return ResizeVulkanTarget(width, height, m_currentSwapFormat);
+#endif
 
     {
         std::wstringstream ss;
@@ -1770,6 +1687,13 @@ bool DX11Renderer::SetPresentCap(double hz)
 
 void DX11Renderer::SetVSync(bool on)
 {
+#ifdef NITLINK_ENABLE_VULKAN
+    if (m_vulkan) {
+        if (m_vsync != on) m_vulkan->RequestResize();
+        m_vsync = on;
+        return;
+    }
+#endif
     m_vsync = on;
     OutputDebugStringW(on
         ? L"[NitLink/Renderer] VSync ON: Present(1, 0); tearing cap bypassed\n"
@@ -1857,6 +1781,11 @@ void DX11Renderer::WaitForFrameReady()
         else if (result == WAIT_FAILED) m_phaseDiagnostics.waitFailed++;
         else if (result == WAIT_IO_COMPLETION) m_phaseDiagnostics.waitAlerted++;
     }
+#ifdef NITLINK_ENABLE_VULKAN
+    else if (m_vulkan) {
+        m_vulkan->WaitForImage();
+    }
+#endif
     m_phaseWaitMs += std::chrono::duration<double, std::milli>(Clock::now() - phaseStart).count();
 }
 
@@ -2246,6 +2175,14 @@ bool DX11Renderer::EndFrame()
 
     const auto presentStart = std::chrono::steady_clock::now();
     HRESULT hrPresent = S_OK;
+#ifdef NITLINK_ENABLE_VULKAN
+    if (m_vulkan) {
+        if (m_vulkan->NeedsResize()) {
+            m_vulkan->Resize(m_device.Get(), m_windowWidth, m_windowHeight, m_currentSwapFormat, m_vsync);
+        }
+        hrPresent = m_vulkan->Present(m_context.Get(), m_vulkanTarget.Get());
+    } else
+#endif
     if (m_vsync) {
         // ALLOW_TEARING is invalid with a nonzero sync interval.
         hrPresent = m_swapChain->Present(1, 0);
@@ -2509,7 +2446,7 @@ static bool WriteJxrScrgbHalf(const std::wstring& path, const uint8_t* pixels,
 
 bool DX11Renderer::SaveScreenshot(const std::wstring& path)
 {
-    if (!m_swapChain) {
+    if (!m_swapChain && !UsesVulkanPresentation()) {
         OutputDebugStringW(L"[NitLink/Renderer] Screenshot: no swap chain\n");
         return false;
     }
@@ -2519,7 +2456,7 @@ bool DX11Renderer::SaveScreenshot(const std::wstring& path)
     // EndFrame()'s Present, since FLIP_DISCARD leaves buffer 0 undefined
     // after Present. See the dispatch call sites in Application::Run.
     ComPtr<ID3D11Texture2D> backBuffer;
-    HRESULT hr = m_swapChain->GetBuffer(0, IID_PPV_ARGS(&backBuffer));
+    HRESULT hr = GetPresentationTexture(&backBuffer);
     if (FAILED(hr)) {
         OutputDebugStringW(L"[NitLink/Renderer] Screenshot: GetBuffer failed\n");
         return false;
@@ -2671,7 +2608,7 @@ void DX11Renderer::QueryHDRDisplayInfo()
     m_displayMinLum       = 0.0f;
     m_displayMaxLum       = 80.0f;
 
-    if (!m_device || !m_swapChain) return;
+    if (!m_device) return;
 
     // CRITICAL: create a FRESH IDXGIFactory1 every call instead of walking
     // the device's cached adapter. DXGI caches output descriptors against
@@ -2902,6 +2839,16 @@ bool DX11Renderer::SetHDREnabled(bool enable)
     // Refresh the display's HDR state first so the right status is reported
     // back to settings UI even if HDR engagement fails.
     QueryHDRDisplayInfo();
+
+#ifdef NITLINK_ENABLE_VULKAN
+    if (m_vulkan) {
+        if (enable && !m_hdrEngagedByOS) return false;
+        const DXGI_FORMAT format = enable ? DXGI_FORMAT_R10G10B10A2_UNORM : DXGI_FORMAT_B8G8R8A8_UNORM;
+        if (!ResizeVulkanTarget(m_windowWidth, m_windowHeight, format)) return false;
+        m_hdrEnabled = enable;
+        return true;
+    }
+#endif
 
     if (enable) {
         // Gate: HDR10 requires Windows HDR to be ENGAGED at the OS level.

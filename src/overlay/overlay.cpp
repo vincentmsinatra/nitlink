@@ -2,6 +2,7 @@
 #include "overlay.h"
 #include "../ui/theme.h"
 #include "../app/localization.h"
+#include "../renderer/dx11_renderer.h"
 #include "no_signal_cache.h"
 #include "no_signal_layout.h"
 #include <sstream>
@@ -25,13 +26,11 @@ static std::wstring Tr(const wchar_t* key) {
     return Localization::Instance().Get(key);
 }
 
-bool Overlay::Initialize(ID3D11Device* device, ID3D11DeviceContext* context,
-                         IDXGISwapChain1* swapChain, HWND hwnd)
+bool Overlay::Initialize(DX11Renderer& renderer)
 {
-    m_device    = device;
-    m_context   = context;
-    m_swapChain = swapChain;
-    m_hwnd      = hwnd;
+    m_device = renderer.GetDevice();
+    m_context = renderer.GetContext();
+    m_renderer = &renderer;
     m_deviceLost = false;
 
     // D2D factory: single-threaded since it's only used from the render thread.
@@ -54,7 +53,7 @@ bool Overlay::Initialize(ID3D11Device* device, ID3D11DeviceContext* context,
 
     // Bridge the D3D11 device to D2D via DXGI -- requires D3D11_CREATE_DEVICE_BGRA_SUPPORT
     ComPtr<IDXGIDevice> dxgiDevice;
-    hr = device->QueryInterface(IID_PPV_ARGS(&dxgiDevice));
+    hr = m_device->QueryInterface(IID_PPV_ARGS(&dxgiDevice));
     if (FAILED(hr)) {
         std::wstringstream ss;
         ss << L"QueryInterface(IDXGIDevice) failed: 0x" << std::hex << hr;
@@ -386,7 +385,7 @@ bool Overlay::CreateNoSignalBitmap()
 bool Overlay::CreateD2DResources()
 {
     ComPtr<ID3D11Texture2D> backBuffer;
-    HRESULT hr = m_swapChain->GetBuffer(0, IID_PPV_ARGS(&backBuffer));
+    HRESULT hr = m_renderer->GetPresentationTexture(&backBuffer);
     if (FAILED(hr)) return false;
 
     D3D11_TEXTURE2D_DESC bbDesc;
@@ -434,7 +433,7 @@ bool Overlay::CreateD2DResources()
     m_offscreenSRV.Reset();
 
     ComPtr<IDXGISurface> dxgiBackBuffer;
-    hr = m_swapChain->GetBuffer(0, IID_PPV_ARGS(&dxgiBackBuffer));
+    hr = backBuffer.As(&dxgiBackBuffer);
     if (FAILED(hr)) return false;
 
     D2D1_BITMAP_PROPERTIES1 bmpProps = D2D1::BitmapProperties1(
@@ -559,8 +558,7 @@ void Overlay::Shutdown()
     m_wicFactory.Reset();
     m_device = nullptr;
     m_context = nullptr;
-    m_swapChain = nullptr;
-    m_hwnd = nullptr;
+    m_renderer = nullptr;
     m_initialized = false;
 }
 
@@ -1057,9 +1055,9 @@ void Overlay::DrawNoSignal(uint32_t windowW, uint32_t windowH)
 
         D2D1_RECT_F rTag = D2D1::RectF(
             cardX + ipx + S(88.0f), brandY + S(5.0f),
-            cardX + ipx + S(180.0f), brandY + S(22.0f));
+            cardX + ipx + S(220.0f), brandY + S(22.0f));
         fBrandTag->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
-        const wchar_t* tag = L"v1.2.6";
+        const wchar_t* tag = L"v1.2.6-latencyFix";
         m_d2dContext->DrawText(tag, (UINT32)wcslen(tag),
             fBrandTag.Get(), rTag, bFgMuted.Get());
     }

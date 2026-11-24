@@ -2,6 +2,8 @@
 #include "app/present_cap_policy.h"
 #include "renderer/present_cap_clock.h"
 #include <chrono>
+#include <array>
+#include <cstring>
 #include <iostream>
 #include <stdexcept>
 
@@ -55,6 +57,37 @@ struct DX11RendererTestAccess {
     {
         if (renderer.m_presentCapTimer) CloseHandle(renderer.m_presentCapTimer);
         renderer.m_presentCapTimer = nullptr;
+    }
+    static bool UploadSplitPlanes(DX11Renderer& renderer, DX11Renderer::CaptureFormatKind format,
+                                  const uint8_t* data, uint32_t size, uint32_t rowBytes)
+    {
+        constexpr uint32_t width = 4, height = 4;
+        renderer.SetSourceFormat(format);
+        if (!renderer.CreateCaptureResources(width, height, format, true)) return false;
+        renderer.UpdateCaptureTexture(data, size, width, height);
+        if (!renderer.HasCaptureFrame()) return false;
+
+        auto matches = [&](ID3D11Texture2D* plane, const uint8_t* expected) {
+            D3D11_TEXTURE2D_DESC desc{};
+            plane->GetDesc(&desc);
+            desc.Usage = D3D11_USAGE_STAGING;
+            desc.BindFlags = 0;
+            desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+            ComPtr<ID3D11Texture2D> readback;
+            if (FAILED(renderer.m_device->CreateTexture2D(&desc, nullptr, &readback))) return false;
+            renderer.m_context->CopyResource(readback.Get(), plane);
+            D3D11_MAPPED_SUBRESOURCE mapped{};
+            if (FAILED(renderer.m_context->Map(readback.Get(), 0, D3D11_MAP_READ, 0, &mapped))) return false;
+            bool valid = mapped.RowPitch >= rowBytes;
+            for (uint32_t row = 0; valid && row < desc.Height; ++row) {
+                valid = std::memcmp(static_cast<const uint8_t*>(mapped.pData) + row * mapped.RowPitch,
+                                    expected + row * rowBytes, rowBytes) == 0;
+            }
+            renderer.m_context->Unmap(readback.Get(), 0);
+            return valid;
+        };
+        return matches(renderer.m_captureTexture.Get(), data) &&
+               matches(renderer.m_captureTextureUV.Get(), data + height * rowBytes);
     }
 };
 }
@@ -187,6 +220,14 @@ int main()
         renderer.WaitForFrameReady();
         Require(Clock::now() >= fallbackDeadline,
                 "an unavailable high-resolution timer still enforces the cap deadline");
+        std::array<uint8_t, 48> capture{};
+        for (size_t i = 0; i < capture.size(); ++i) capture[i] = static_cast<uint8_t>(i * 5);
+        Require(DX11RendererTestAccess::UploadSplitPlanes(renderer,
+                    DX11Renderer::CaptureFormatKind::NV12, capture.data(), 24, 4),
+                "NV12 split textures preserve every packed luma and chroma byte");
+        Require(DX11RendererTestAccess::UploadSplitPlanes(renderer,
+                    DX11Renderer::CaptureFormatKind::P010, capture.data(), 48, 8),
+                "P010 split textures preserve every packed luma and chroma byte");
         std::cout << "PASS offscreen WARP cap, Low Latency, VSync, Off and marker wait paths\n";
     } catch (const std::exception& error) {
         std::cerr << "FAIL " << error.what() << '\n';

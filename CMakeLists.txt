@@ -95,6 +95,15 @@ set(NITLINK_SOURCES
 
 add_executable(NitLink WIN32 ${NITLINK_SOURCES})
 
+option(NITLINK_ENABLE_VULKAN "Build the optional Vulkan presentation backend" OFF)
+if(NITLINK_ENABLE_VULKAN)
+    find_path(NITLINK_VULKAN_INCLUDE_DIR vulkan/vulkan.hpp HINTS ENV VULKAN_SDK
+        PATH_SUFFIXES Include include REQUIRED)
+    target_sources(NitLink PRIVATE src/renderer/vulkan_presenter.cpp)
+    target_include_directories(NitLink SYSTEM PRIVATE ${NITLINK_VULKAN_INCLUDE_DIR})
+    target_compile_definitions(NitLink PRIVATE NITLINK_ENABLE_VULKAN)
+endif()
+
 # Keep WIL line diagnostics without embedding source filenames in the executable.
 target_compile_definitions(NitLink PRIVATE RESULT_DIAGNOSTICS_LEVEL=2)
 

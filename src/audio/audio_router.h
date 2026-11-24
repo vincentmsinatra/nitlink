@@ -210,6 +210,7 @@ private:
     // Per-window counters for the periodic stats line.
     uint64_t m_winIn = 0, m_winOut = 0, m_winUnderrun = 0, m_winOverrun = 0;
     uint64_t m_winSlipDrop = 0, m_winSlipDup = 0;
+    uint64_t m_winDiscontinuities = 0, m_winTimestampErrors = 0;
     uint32_t m_winFillMin = 0xFFFFFFFFu, m_winFillMax = 0;
     std::chrono::steady_clock::time_point m_winStart{};
 

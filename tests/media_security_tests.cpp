@@ -112,8 +112,94 @@ public:
     HRESULT STDMETHODCALLTYPE GetId(LPWSTR*) override { return E_NOTIMPL; }
     HRESULT STDMETHODCALLTYPE GetState(DWORD*) override { return E_NOTIMPL; }
 };
+
+class FlaggedCapturePacket final : public IAudioCaptureClient {
+public:
+    explicit FlaggedCapturePacket(DWORD flags) : m_flags(flags) {}
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID, void** value) override {
+        *value = nullptr;
+        return E_NOINTERFACE;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return ++m_refs; }
+    ULONG STDMETHODCALLTYPE Release() override {
+        const ULONG remaining = --m_refs;
+        if (!remaining) delete this;
+        return remaining;
+    }
+    HRESULT STDMETHODCALLTYPE GetNextPacketSize(UINT32* frames) override {
+        *frames = m_released ? 0 : 2;
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE GetBuffer(BYTE** data, UINT32* frames, DWORD* flags,
+                                        UINT64* position, UINT64* qpc) override {
+        *data = reinterpret_cast<BYTE*>(m_samples);
+        *frames = 2;
+        *flags = m_flags;
+        *position = 1800ULL * 48000;
+        *qpc = (100ULL + 1800) * 10000000;
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE ReleaseBuffer(UINT32 frames) override {
+        Check(frames == 2 && !m_released, "flagged packet is released once");
+        m_released = true;
+        return S_OK;
+    }
+
+private:
+    ULONG m_refs = 1;
+    DWORD m_flags;
+    bool m_released = false;
+    int16_t m_samples[2] = {500, 600};
+};
+
 namespace NitLink {
 struct AudioRouterTestAccess {
+    static void CaptureTimingFaults() {
+        for (DWORD flags : {DWORD(AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR),
+                            DWORD(AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY),
+                            DWORD(AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR |
+                                  AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY)}) {
+            AudioRouter router;
+            Check(router.FifoReset(sizeof(int16_t), 48000), "capture glitch FIFO");
+            router.m_captureService.Attach(new FlaggedCapturePacket(flags));
+            router.m_captureBufferFrames = 2;
+            router.m_fifoPrimed = true;
+            router.m_phase = 31.25;
+            const int16_t queued[] = {100, 200, 300, 400};
+            router.FifoPush(reinterpret_cast<const BYTE*>(queued), 4, false);
+
+            const double now = std::chrono::duration<double>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+            for (unsigned i = 0; i < 300; ++i) {
+                const auto position = 1797ULL * 48000 + i * 480;
+                const auto qpc = 1897ULL * 10000000 + i * 100000;
+                router.m_captureClockRate.Sample(position, qpc, 48000, now - 3 + i * .01);
+                router.m_renderClockRate.Sample(position, qpc, 48000, now - 3 + i * .01);
+            }
+            Check(router.m_captureClockRate.Valid(now), "capture estimate valid at the 30-minute mark");
+
+            router.m_running = true;
+            const bool drained = router.DrainCapture();
+            router.m_running = false;
+            Check(drained, "flagged capture packet drains");
+            Check(router.m_fifoPrimed && router.m_phase == 31.25,
+                  "capture timing flags preserve playback and resampler phase");
+            const bool discontinuity = (flags & AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY) != 0;
+            Check(router.m_captureClockRate.Valid(now) == !discontinuity &&
+                  router.m_renderClockRate.Valid(now),
+                  "bad timestamps retain the fit; discontinuities invalidate only the capture clock");
+            const bool timestampError = (flags & AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR) != 0;
+            Check(router.m_winDiscontinuities == unsigned(discontinuity) &&
+                  router.m_winTimestampErrors == unsigned(timestampError) && router.Resyncs() == 0,
+                  "packet timing flags are reported separately from FIFO resyncs");
+            int16_t output[6]{};
+            const int16_t expected[] = {100, 200, 300, 400, 500, 600};
+            Check(router.FifoPop(reinterpret_cast<BYTE*>(output), 6) == 6 &&
+                  std::memcmp(output, expected, sizeof(expected)) == 0,
+                  "queued PCM plays in order across capture timing faults");
+        }
+    }
+
     static void PacketDrift() {
         WAVEFORMATEX pcm{WAVE_FORMAT_PCM,2,48000,192000,4,16,0};
         ExclusiveState state; state.frames=144; state.minimum=30000;
@@ -268,6 +354,7 @@ struct AudioRouterTestAccess {
         router.TeardownRender(); router.TeardownCapture();
     }
     static void Run() {
+        CaptureTimingFaults();
         Focus();
         Exclusive();
         PacketDrift();
